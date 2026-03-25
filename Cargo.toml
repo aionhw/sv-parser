@@ -1,0 +1,17 @@
+[package]
+name = "sv-parser"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "SystemVerilog parser targeting IEEE 1800-2017/2023"
+license = "Apache-2.0"
+keywords = ["systemverilog", "parser", "hdl", "verilog", "eda"]
+categories = ["parser-implementations", "development-tools"]
+
+[lib]
+name = "sv_parser"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sv-parse"
+path = "src/main.rs"
