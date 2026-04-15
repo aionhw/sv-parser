@@ -1,6 +1,6 @@
 //! SystemVerilog data types (IEEE 1800-2017 §6, §7)
 
-use super::{Identifier, Span, Spanned, expr};
+use super::{Identifier, Span, expr};
 
 /// Data type AST node.
 #[derive(Debug, Clone)]
@@ -13,6 +13,7 @@ pub enum DataType {
     Enum(EnumType),
     Void(Span),
     TypeReference { name: TypeName, dimensions: Vec<PackedDimension>, span: Span },
+    Interface { name: Identifier, modport: Option<Identifier>, span: Span },
     Implicit { signing: Option<Signing>, dimensions: Vec<PackedDimension>, span: Span },
 }
 
@@ -50,6 +51,7 @@ pub enum UnpackedDimension {
     Expression { expr: Box<expr::Expression>, span: Span },
     Unsized(Span),
     Queue { max_size: Option<Box<expr::Expression>>, span: Span },
+    Associative { data_type: Option<Box<DataType>>, span: Span },
 }
 
 /// struct/union type

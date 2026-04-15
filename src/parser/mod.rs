@@ -8,7 +8,7 @@ mod declarations;
 mod items;
 
 use crate::ast::*;
-use crate::ast::module::*;
+use crate::ast::decl::{ModuleItem, PackageItem};
 use crate::lexer::token::{Token, TokenKind};
 use crate::diagnostics::Diagnostic;
 
@@ -54,16 +54,54 @@ impl Parser {
                 Some(Description::Program(self.parse_program_declaration())),
             TokenKind::KwPackage =>
                 Some(Description::Package(self.parse_package_declaration())),
+            TokenKind::KwNettype => {
+                if let Some(ModuleItem::NettypeDeclaration(n)) = self.parse_module_item() {
+                    Some(Description::PackageItem(PackageItem::Nettype(n)))
+                } else { None }
+            }
             TokenKind::KwClass =>
                 Some(Description::Class(self.parse_class_declaration())),
+            TokenKind::KwChecker => {
+                if let Some(ModuleItem::CheckerDeclaration(c)) = self.parse_module_item() {
+                    Some(Description::PackageItem(PackageItem::Checker(c)))
+                } else { None }
+            }
             TokenKind::KwVirtual if self.peek_kind() == TokenKind::KwClass =>
                 Some(Description::Class(self.parse_class_declaration())),
+            TokenKind::KwLet => {
+                if let Some(ModuleItem::LetDeclaration(l)) = self.parse_module_item() {
+                    Some(Description::PackageItem(PackageItem::Let(l)))
+                } else { None }
+            }
             TokenKind::KwTypedef =>
                 Some(Description::TypedefDecl(self.parse_typedef_declaration())),
-            TokenKind::KwImport =>
-                Some(Description::ImportDecl(self.parse_import_declaration())),
+            TokenKind::KwImport => {
+                if self.peek_kind() == TokenKind::StringLiteral {
+                    Some(Description::DPIImport(self.parse_dpi_import()))
+                } else {
+                    Some(Description::ImportDecl(self.parse_import_declaration()))
+                }
+            }
+            TokenKind::KwExport => {
+                if self.peek_kind() == TokenKind::StringLiteral {
+                    Some(Description::DPIExport(self.parse_dpi_export()))
+                } else {
+                    self.bump();
+                    while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) { self.bump(); }
+                    self.expect(TokenKind::Semicolon);
+                    self.parse_description()
+                }
+            }
+            TokenKind::KwExtern => {
+                self.bump();
+                self.parse_description()
+            }
             TokenKind::KwTimeunit | TokenKind::KwTimeprecision =>
                 Some(Description::TimeunitsDecl(self.parse_timeunits_declaration())),
+            TokenKind::KwFunction =>
+                Some(Description::PackageItem(self.parse_package_item().unwrap())),
+            TokenKind::KwTask =>
+                Some(Description::PackageItem(self.parse_package_item().unwrap())),
             TokenKind::Directive => { self.bump(); self.parse_description() }
             _ => None,
         }

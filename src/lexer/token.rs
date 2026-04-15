@@ -16,6 +16,7 @@ impl Token {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(non_camel_case_types)]
 pub enum TokenKind {
     // Literals
     IntegerLiteral,
@@ -44,6 +45,7 @@ pub enum TokenKind {
     Lt, Gt, Leq, Geq, // < > <= >=
     ShiftLeft, ShiftRight, ArithShiftLeft, ArithShiftRight, // << >> <<< >>>
     Arrow, DoubleArrow, FatArrow, // -> ->> =>
+    OrMinusArrow, OrFatArrow, // |-> |=>
     PlusColon, MinusColon, // +: -:
     ColonSlash, // :/
     ApostropheLBrace, // '{

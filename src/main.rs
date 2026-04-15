@@ -11,6 +11,7 @@
 //!   --help          Show this help
 
 use sv_parser::*;
+use sv_parser::diagnostics::format_diagnostic;
 use std::process;
 
 fn main() {
@@ -107,10 +108,10 @@ fn main() {
         };
 
         for err in &result.errors {
-            eprintln!("{}: error: {}", file, err.message);
+            eprintln!("{}", format_diagnostic(&result.source_text, err).replace("<source>", file));
         }
         for warn in &result.warnings {
-            eprintln!("{}: warning: {}", file, warn.message);
+            eprintln!("{}", format_diagnostic(&result.source_text, warn).replace("<source>", file));
         }
 
         total_errors += result.errors.len();

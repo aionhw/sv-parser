@@ -22,13 +22,171 @@ pub enum ModuleItem {
     GenerateRegion(GenerateRegion),
     /// Generate-if: condition + then-items, and a chain of (condition, items) for else-if/else
     GenerateIf(GenerateIf),
+    GenerateFor(GenerateFor),
     GenvarDeclaration(GenvarDeclaration),
     FunctionDeclaration(FunctionDeclaration),
     TaskDeclaration(TaskDeclaration),
     ImportDeclaration(ImportDeclaration),
     ClassDeclaration(ClassDeclaration),
     AssertionItem(super::stmt::AssertionStatement),
+    ModportDeclaration(ModportDeclaration),
+    PropertyDeclaration(PropertyDeclaration),
+    SequenceDeclaration(SequenceDeclaration),
+    CovergroupDeclaration(CovergroupDeclaration),
+    ClockingDeclaration(ClockingDeclaration),
+    CheckerDeclaration(CheckerDeclaration),
+    LetDeclaration(LetDeclaration),
+    NettypeDeclaration(NettypeDeclaration),
+    SpecifyBlock(SpecifyBlock),
+    DPIImport(DPIImport),
+    DPIExport(DPIExport),
     Null,
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckerDeclaration {
+    pub name: Identifier,
+    pub ports: super::module::PortList,
+    pub items: Vec<ModuleItem>,
+    pub endlabel: Option<Identifier>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct LetDeclaration {
+    pub name: Identifier,
+    pub ports: super::module::PortList, // let parameters look like ports
+    pub expr: Expression,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct NettypeDeclaration {
+    pub data_type: DataType,
+    pub name: Identifier,
+    pub resolver: Option<Identifier>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpecifyBlock {
+    pub paths: Vec<SpecifyPath>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpecifyPath {
+    pub src: Identifier,
+    pub dst: Identifier,
+    pub delay: Expression,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct DPIImport {
+    pub property: Option<DPIProperty>,
+    pub c_name: Option<String>,
+    pub proto: DPIProto,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct DPIExport {
+    pub c_name: Option<String>,
+    pub proto: DPIProto,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum DPIProto {
+    Function(FunctionDeclaration),
+    Task(TaskDeclaration),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DPIProperty { Context, Pure }
+
+#[derive(Debug, Clone)]
+pub struct ClockingDeclaration {
+    pub name: Identifier,
+    pub signals: Vec<ClockingSignal>,
+    pub items: Vec<super::stmt::Statement>, // Approximate clocking body as statements
+    pub endlabel: Option<Identifier>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClockingSignal {
+    pub direction: PortDirection,
+    pub name: Identifier,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct CovergroupDeclaration {
+    pub name: Identifier,
+    pub event: Option<super::stmt::EventControl>,
+    pub items: Vec<CovergroupItem>,
+    pub endlabel: Option<Identifier>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum CovergroupItem {
+    Coverpoint(Coverpoint),
+    Cross(Cross),
+    Option { name: String, val: Expression },
+    TypeOption { name: String, val: Expression },
+}
+
+#[derive(Debug, Clone)]
+pub struct Coverpoint {
+    pub name: Option<Identifier>,
+    pub expr: Expression,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct Cross {
+    pub name: Option<Identifier>,
+    pub items: Vec<Identifier>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct PropertyDeclaration {
+    pub name: Identifier,
+    pub items: Vec<super::stmt::Statement>, // Approximate property body as statements for parsing
+    pub endlabel: Option<Identifier>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct SequenceDeclaration {
+    pub name: Identifier,
+    pub items: Vec<super::stmt::Statement>, // Approximate sequence body as statements
+    pub endlabel: Option<Identifier>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModportDeclaration {
+    pub items: Vec<ModportItem>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModportItem {
+    pub name: Identifier,
+    pub ports: Vec<ModportPort>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModportPort {
+    pub direction: PortDirection,
+    pub name: Identifier,
+    pub span: Span,
 }
 
 /// Verilog gate-level primitive instantiation (IEEE 1800-2017 §28)
@@ -168,9 +326,15 @@ pub struct ModuleInstantiation {
 }
 
 #[derive(Debug, Clone)]
+pub enum ParamValue {
+    Expr(Expression),
+    Type(DataType),
+}
+
+#[derive(Debug, Clone)]
 pub enum ParamConnection {
-    Ordered(Option<Expression>),
-    Named { name: Identifier, value: Option<Expression> },
+    Ordered(Option<ParamValue>),
+    Named { name: Identifier, value: Option<ParamValue> },
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +366,22 @@ pub struct GenerateIf {
     pub span: Span,
 }
 
+/// A generate-for loop: for (init; cond; incr) items
+#[derive(Debug, Clone)]
+pub struct GenerateFor {
+    /// Genvar name
+    pub var: String,
+    /// Initial value
+    pub init_val: i64,
+    /// Condition expression
+    pub cond: super::expr::Expression,
+    /// Increment expression (genvar update)
+    pub incr: super::expr::Expression,
+    /// Body items to replicate
+    pub items: Vec<ModuleItem>,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub struct GenvarDeclaration {
     pub names: Vec<Identifier>,
@@ -212,9 +392,9 @@ pub struct GenvarDeclaration {
 pub struct FunctionDeclaration {
     pub lifetime: Option<Lifetime>,
     pub return_type: DataType,
-    pub name: Identifier,
+    pub name: TypeName,
     pub ports: Vec<FunctionPort>,
-    pub items: Vec<Statement>,
+    pub items: Vec<super::stmt::Statement>,
     pub endlabel: Option<Identifier>,
     pub span: Span,
 }
@@ -222,9 +402,9 @@ pub struct FunctionDeclaration {
 #[derive(Debug, Clone)]
 pub struct TaskDeclaration {
     pub lifetime: Option<Lifetime>,
-    pub name: Identifier,
+    pub name: TypeName,
     pub ports: Vec<FunctionPort>,
-    pub items: Vec<Statement>,
+    pub items: Vec<super::stmt::Statement>,
     pub endlabel: Option<Identifier>,
     pub span: Span,
 }
@@ -276,7 +456,7 @@ pub struct ClassDeclaration {
 #[derive(Debug, Clone)]
 pub struct ClassExtends {
     pub name: Identifier,
-    pub args: Vec<super::expr::Expression>,
+    pub args: Vec<ParamValue>,
     pub span: Span,
 }
 
@@ -296,7 +476,7 @@ pub enum ClassItem {
     /// Class inside class (nested)
     Class(ClassDeclaration),
     /// Covergroup inside class
-    Covergroup { name: Identifier, span: Span },
+    Covergroup(CovergroupDeclaration),
     /// Import statement
     Import(ImportDeclaration),
     /// Empty item (stray semicolons)
@@ -335,8 +515,26 @@ pub enum ClassMethodKind {
 pub struct ClassConstraint {
     pub is_static: bool,
     pub name: Identifier,
-    /// Constraint body tokens (unparsed — constraint expressions are complex)
+    pub items: Vec<ConstraintItem>,
     pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum ConstraintItem {
+    Expr(Expression),
+    Inside { expr: Expression, range: Vec<ConstraintRange>, span: Span },
+    Implication { condition: Expression, constraint: Box<ConstraintItem>, span: Span },
+    IfElse { condition: Expression, then_item: Box<ConstraintItem>, else_item: Option<Box<ConstraintItem>>, span: Span },
+    Foreach { array: Expression, vars: Vec<Option<Identifier>>, item: Box<ConstraintItem>, span: Span },
+    Solve { before: Vec<Identifier>, after: Vec<Identifier>, span: Span },
+    Soft(Box<ConstraintItem>),
+    Block(Vec<ConstraintItem>),
+}
+
+#[derive(Debug, Clone)]
+pub enum ConstraintRange {
+    Value(Expression),
+    Range { lo: Expression, hi: Expression },
 }
 
 /// Qualifiers for class properties and methods.
@@ -360,6 +558,11 @@ pub enum PackageItem {
     Function(FunctionDeclaration),
     Task(TaskDeclaration),
     Import(ImportDeclaration),
+    DPIImport(DPIImport),
+    DPIExport(DPIExport),
     Data(DataDeclaration),
     Class(ClassDeclaration),
+    Checker(CheckerDeclaration),
+    Let(LetDeclaration),
+    Nettype(NettypeDeclaration),
 }

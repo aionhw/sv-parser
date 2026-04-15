@@ -68,15 +68,109 @@ impl Preprocessor {
     /// Preprocess source text, resolving `include directives relative to `source_path`.
     /// If `source_path` is None, `include directives that require file I/O are skipped.
     pub fn preprocess_file(&mut self, source: &str, source_path: Option<&Path>) -> String {
-        self.preprocess_inner(source, source_path)
+        // Automatically add the source file's parent directory to include search
+        if let Some(path) = source_path {
+            if let Some(parent) = path.parent() {
+                let parent = if parent.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    parent.to_path_buf()
+                };
+                self.add_include_dir(parent);
+            }
+        }
+        let stripped = self.strip_comments(source);
+        let resolved = self.resolve_directives(&stripped, source_path);
+        let expanded = self.expand_macros(&resolved);
+        Self::strip_attributes(&expanded)
     }
 
     /// Simple preprocessing pass (no file context — `include lines are skipped).
     pub fn preprocess(&mut self, source: &str) -> String {
-        self.preprocess_inner(source, None)
+        let stripped = self.strip_comments(source);
+        let resolved = self.resolve_directives(&stripped, None);
+        let expanded = self.expand_macros(&resolved);
+        Self::strip_attributes(&expanded)
     }
 
-    fn preprocess_inner(&mut self, source: &str, source_path: Option<&Path>) -> String {
+    fn strip_comments(&self, source: &str) -> String {
+        let mut result = String::with_capacity(source.len());
+        let bytes = source.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'/' && i + 1 < bytes.len() {
+                if bytes[i+1] == b'/' {
+                    // Line comment: replace with spaces until newline to preserve line numbers
+                    // BUT: keep the backslash if it's at the end of the line (continuation)
+                    let start = i;
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    // Check if the line ends with a backslash (ignoring whitespace)
+                    let mut j = i;
+                    while j > start && bytes[j-1].is_ascii_whitespace() {
+                        j -= 1;
+                    }
+                    if j > start && bytes[j-1] == b'\\' {
+                        // Preserve the backslash by replacing everything else with spaces
+                        for _ in start..j-1 { result.push(' '); }
+                        result.push('\\');
+                        for _ in j..i { result.push(' '); }
+                    } else {
+                        for _ in start..i { result.push(' '); }
+                    }
+                    continue;
+                }
+                if bytes[i+1] == b'*' {
+                    // Block comment: replace with spaces and newlines
+                    result.push(' ');
+                    result.push(' ');
+                    i += 2;
+                    while i + 1 < bytes.len() {
+                        if bytes[i] == b'*' && bytes[i+1] == b'/' {
+                            result.push(' ');
+                            result.push(' ');
+                            i += 2;
+                            break;
+                        }
+                        if bytes[i] == b'\n' {
+                            result.push('\n');
+                        } else {
+                            result.push(' ');
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
+            if bytes[i] == b'"' {
+                // String literal: skip until closing quote
+                result.push('\"');
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        result.push('\\');
+                        result.push(bytes[i+1] as char);
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'"' {
+                        result.push('\"');
+                        i += 1;
+                        break;
+                    }
+                    result.push(bytes[i] as char);
+                    i += 1;
+                }
+                continue;
+            }
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+        result
+    }
+
+    fn resolve_directives(&mut self, source: &str, source_path: Option<&Path>) -> String {
         let mut output = String::with_capacity(source.len());
         let mut lines = source.lines().peekable();
         let mut ifdef_stack: Vec<bool> = Vec::new(); // true = active
@@ -88,18 +182,44 @@ impl Preprocessor {
             let trimmed = line.trim();
 
             // Strip (* ... *) attributes (IEEE 1800-2017 §5.12)
-            // These are synthesis/tool directives that don't affect simulation
             if trimmed.starts_with("(*") && trimmed.ends_with("*)") {
                 output.push('\n');
                 continue;
             }
 
             if trimmed.starts_with("`define") {
-                if ifdef_stack.iter().all(|&b| b) {
-                    self.parse_define(trimmed);
+                // Join backslash-continuation lines (IEEE 1800-2017 §22.5.1)
+                let mut consumed_lines = 1;
+                
+                // For the directive, we want to strip the \ and the newline
+                let mut clean_line = String::new();
+                let mut current = line.to_string();
+                
+                loop {
+                    let mut text = current.as_str();
+                    // Handle trailing comment if any? No, trim_end handles it if it's after \.
+                    // But if comment has \, it's tricky. Let's assume clean source after strip_comments.
+                    if let Some(pos) = text.trim_end().rfind('\\') {
+                        if text[pos+1..].chars().all(|c| c.is_ascii_whitespace()) {
+                            clean_line.push_str(&text[..pos]);
+                            if let Some(next) = lines.next() {
+                                consumed_lines += 1;
+                                current = next.to_string();
+                                continue;
+                            }
+                        }
+                    }
+                    clean_line.push_str(text);
+                    break;
                 }
-                // Don't output `define lines
-                output.push('\n');
+                
+                if ifdef_stack.iter().all(|&b| b) {
+                    self.parse_define(&clean_line);
+                }
+                // Don't output `define lines, but preserve line numbers
+                for _ in 0..consumed_lines {
+                    output.push('\n');
+                }
                 continue;
             }
 
@@ -157,7 +277,8 @@ impl Preprocessor {
                             match std::fs::read_to_string(&resolved) {
                                 Ok(contents) => {
                                     self.include_depth += 1;
-                                    let included = self.preprocess_inner(&contents, Some(&resolved));
+                                    let stripped = self.strip_comments(&contents);
+                                    let included = self.resolve_directives(&stripped, Some(&resolved));
                                     self.include_depth -= 1;
                                     output.push_str(&included);
                                     // Don't push extra newline — included content has its own
@@ -193,11 +314,7 @@ impl Preprocessor {
                 continue;
             }
 
-            // Expand macros in the line
-            let expanded = self.expand_macros(line);
-            // Strip inline (* ... *) attributes
-            let expanded = Self::strip_attributes(&expanded);
-            output.push_str(&expanded);
+            output.push_str(line);
             output.push('\n');
         }
 
@@ -251,35 +368,60 @@ impl Preprocessor {
             }
         }
 
+        // Fallback: try relative to current working directory
+        if let Ok(cwd) = std::env::current_dir() {
+            let candidate = cwd.join(inc_path);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+
         None
     }
 
     fn parse_define(&mut self, line: &str) {
-        let rest = line[7..].trim(); // after `define
+        let trimmed = line.trim();
+        if !trimmed.starts_with("`define") { return; }
+        let rest = trimmed[7..].trim(); // after `define
         // Find name
         let name_end = rest.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(rest.len());
         let name = rest[..name_end].to_string();
-        let after_name = &rest[name_end..];
+        let after_name = rest[name_end..].trim_start();
         
         // Check for parameterized macro: `define NAME(param1, param2) body
-        let (params, body) = if after_name.starts_with('(') {
-            // Find closing paren
-            if let Some(close) = after_name.find(')') {
-                let param_str = &after_name[1..close];
+        // Note: LRM says NO space between NAME and '('
+        let (params, body) = if rest[name_end..].starts_with('(') {
+            // Find closing paren (handling nested parens)
+            let mut depth = 0;
+            let mut close_pos = None;
+            for (idx, c) in rest[name_end..].char_indices() {
+                if c == '(' { depth += 1; }
+                else if c == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_pos = Some(name_end + idx);
+                        break;
+                    }
+                }
+            }
+            
+            if let Some(close) = close_pos {
+                let param_str = &rest[name_end + 1..close];
                 let params: Vec<String> = param_str.split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
-                let body = after_name[close + 1..].trim().to_string();
+                let body = rest[close + 1..].to_string();
                 (Some(params), body)
             } else {
-                (None, after_name.trim().to_string())
+                (None, rest[name_end..].to_string())
             }
         } else {
-            (None, after_name.trim().to_string())
+            (None, after_name.to_string())
         };
         
         if !name.is_empty() {
+            // eprintln!("[PP] defining macro '{}'", name);
             self.defines.insert(name.clone(), MacroDef {
                 name,
                 params,
@@ -288,8 +430,8 @@ impl Preprocessor {
         }
     }
 
-    fn expand_macros(&self, line: &str) -> String {
-        let mut result = self.expand_macros_once(line);
+    fn expand_macros(&self, source: &str) -> String {
+        let mut result = self.expand_macros_once(source);
         // Recursively expand up to 16 times to handle nested macros
         for _ in 0..16 {
             if !result.contains('`') { break; }
@@ -306,21 +448,63 @@ impl Preprocessor {
         let mut i = 0;
         while i < bytes.len() {
             if bytes[i] == b'`' {
+                if i + 1 < bytes.len() && bytes[i+1] == b'`' {
+                    // Concatenation: skip both backticks
+                    i += 2;
+                    continue;
+                }
+                if i + 1 < bytes.len() && bytes[i+1] == b'\"' {
+                    // Stringification: replace with normal quote
+                    result.push('\"');
+                    i += 2;
+                    continue;
+                }
+                
                 i += 1;
                 let start = i;
                 while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
                 let macro_name = &line[start..i];
-                if let Some(def) = self.defines.get(macro_name) {
-                    if def.params.is_some() && i < bytes.len() && bytes[i] == b'(' {
+                if macro_name == "__FILE__" {
+                    result.push('\"');
+                    result.push_str("file"); // Placeholder
+                    result.push('\"');
+                } else if macro_name == "__LINE__" {
+                    result.push_str("0"); // Placeholder
+                } else if let Some(def) = self.defines.get(macro_name) {
+                    // eprintln!("[PP] expanding macro '{}'", macro_name);
+                    let mut p = i;
+                    while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
+                        p += 1;
+                    }
+                    if def.params.is_some() && p < bytes.len() && bytes[p] == b'(' {
+                        i = p;
                         // Parameterized macro: find arguments
                         let args = Self::extract_macro_args(line, &mut i);
                         let params = def.params.as_ref().unwrap();
                         let mut body = def.body.clone();
                         for (pi, pname) in params.iter().enumerate() {
                             if let Some(arg) = args.get(pi) {
-                                body = body.replace(pname, arg);
+                                // Replace only whole words
+                                let mut new_body = String::with_capacity(body.len());
+                                let mut last = 0;
+                                for (start, part) in body.match_indices(pname) {
+                                    // Check if surrounding characters are word characters
+                                    let before = body.as_bytes().get(start.wrapping_sub(1)).copied().unwrap_or(0);
+                                    let after = body.as_bytes().get(start + part.len()).copied().unwrap_or(0);
+                                    
+                                    new_body.push_str(&body[last..start]);
+                                    if !(before.is_ascii_alphanumeric() || before == b'_') &&
+                                       !(after.is_ascii_alphanumeric() || after == b'_') {
+                                        new_body.push_str(arg);
+                                    } else {
+                                        new_body.push_str(part);
+                                    }
+                                    last = start + part.len();
+                                }
+                                new_body.push_str(&body[last..]);
+                                body = new_body;
                             }
                         }
                         result.push_str(&body);
@@ -332,8 +516,9 @@ impl Preprocessor {
                     result.push_str(macro_name);
                 }
             } else {
-                result.push(line[i..].chars().next().unwrap());
-                i += 1;
+                let ch = line[i..].chars().next().unwrap();
+                result.push(ch);
+                i += ch.len_utf8();
             }
         }
         result
@@ -354,14 +539,20 @@ impl Preprocessor {
         let bytes = line.as_bytes();
         *i += 1; // skip '('
         let mut args = Vec::new();
-        let mut depth = 1;
+        let mut paren_depth = 1;
+        let mut brace_depth = 0;
+        let mut bracket_depth = 0;
+        let mut in_string = false;
         let mut arg_start = *i;
-        while *i < bytes.len() && depth > 0 {
+        while *i < bytes.len() && paren_depth > 0 {
             match bytes[*i] {
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
+                b'"' if *i == 0 || bytes[*i - 1] != b'\\' => {
+                    in_string = !in_string;
+                }
+                b'(' if !in_string => paren_depth += 1,
+                b')' if !in_string => {
+                    paren_depth -= 1;
+                    if paren_depth == 0 {
                         let arg = line[arg_start..*i].trim().to_string();
                         if !arg.is_empty() || !args.is_empty() {
                             args.push(arg);
@@ -370,7 +561,11 @@ impl Preprocessor {
                         return args;
                     }
                 }
-                b',' if depth == 1 => {
+                b'{' if !in_string => brace_depth += 1,
+                b'}' if !in_string => if brace_depth > 0 { brace_depth -= 1; },
+                b'[' if !in_string => bracket_depth += 1,
+                b']' if !in_string => if bracket_depth > 0 { bracket_depth -= 1; },
+                b',' if !in_string && paren_depth == 1 && brace_depth == 0 && bracket_depth == 0 => {
                     args.push(line[arg_start..*i].trim().to_string());
                     arg_start = *i + 1;
                 }
@@ -385,27 +580,33 @@ impl Preprocessor {
         let mut result = String::with_capacity(line.len());
         let bytes = line.as_bytes();
         let mut i = 0;
+        let mut in_string = false;
         while i < bytes.len() {
-            if i + 1 < bytes.len() && bytes[i] == b'(' && bytes[i + 1] == b'*' {
-                // Check this isn't inside a string
+            if bytes[i] == b'\"' && (i == 0 || bytes[i - 1] != b'\\') {
+                in_string = !in_string;
+            }
+            if !in_string && i + 1 < bytes.len() && bytes[i] == b'(' && bytes[i + 1] == b'*' {
                 // Find matching *)
                 let mut j = i + 2;
+                let mut found = false;
                 while j + 1 < bytes.len() {
                     if bytes[j] == b'*' && bytes[j + 1] == b')' {
                         j += 2;
+                        found = true;
                         break;
                     }
                     j += 1;
                 }
-                if j <= bytes.len() {
+                if found {
                     // Replace attribute with space to preserve spacing
                     result.push(' ');
                     i = j;
                     continue;
                 }
             }
-            result.push(bytes[i] as char);
-            i += 1;
+            let ch = line[i..].chars().next().unwrap();
+            result.push(ch);
+            i += ch.len_utf8();
         }
         result
     }

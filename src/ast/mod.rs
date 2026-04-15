@@ -55,4 +55,7 @@ pub enum Description {
     TypedefDecl(decl::TypedefDeclaration),
     ImportDecl(decl::ImportDeclaration),
     TimeunitsDecl(decl::TimeunitsDeclaration),
+    PackageItem(decl::PackageItem),
+    DPIImport(decl::DPIImport),
+    DPIExport(decl::DPIExport),
 }

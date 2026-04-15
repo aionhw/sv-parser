@@ -31,6 +31,7 @@ pub enum StatementKind {
     SeqBlock { name: Option<Identifier>, stmts: Vec<Statement> },
     ParBlock { name: Option<Identifier>, join_type: JoinType, stmts: Vec<Statement> },
     TimingControl { control: TimingControl, stmt: Box<Statement> },
+    EventTrigger { nonblocking: bool, name: Identifier, span: Span },
     Wait { condition: Expression, stmt: Box<Statement> },
     WaitFork,
     Disable(Identifier),
@@ -40,6 +41,8 @@ pub enum StatementKind {
     Assertion(AssertionStatement),
     ProceduralContinuous(ProceduralContinuous),
     VarDecl { data_type: DataType, lifetime: Option<Lifetime>, declarators: Vec<VarDeclarator> },
+    Coverpoint { name: Option<Identifier>, expr: Expression, span: Span },
+    Cross { name: Option<Identifier>, items: Vec<Expression>, span: Span },
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +87,7 @@ pub enum EventControl {
     Star,
     ParenStar,
     Identifier(Identifier),
+    HierIdentifier(Expression),
     EventExpr(Vec<EventExpr>),
 }
 

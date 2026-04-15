@@ -23,17 +23,43 @@ pub enum ExprKind {
     Conditional { condition: Box<Expression>, then_expr: Box<Expression>, else_expr: Box<Expression> },
     Concatenation(Vec<Expression>),
     Replication { count: Box<Expression>, exprs: Vec<Expression> },
-    AssignmentPattern(Vec<Expression>),
+    AssignmentPattern(Vec<AssignmentPatternItem>),
     Call { func: Box<Expression>, args: Vec<Expression> },
     SystemCall { name: String, args: Vec<Expression> },
+    NamedArg { name: Identifier, expr: Option<Box<Expression>> },
+    Inside { expr: Box<Expression>, ranges: Vec<Expression> },
     MemberAccess { expr: Box<Expression>, member: Identifier },
     Index { expr: Box<Expression>, index: Box<Expression> },
     RangeSelect { expr: Box<Expression>, kind: RangeKind, left: Box<Expression>, right: Box<Expression> },
+    Range(Box<Expression>, Box<Expression>),
     Paren(Box<Expression>),
     Dollar,
     Null,
     This,
     Empty,
+}
+
+#[derive(Debug, Clone)]
+pub enum AssignmentPatternItem {
+    /// Ordered: `'{expr, expr}`
+    Ordered(Expression),
+    /// Named: `'{name: expr, name: expr}`
+    Named(Identifier, Expression),
+    /// Typed: `'{type: expr}`
+    Typed(super::types::DataType, Expression),
+    /// Default: `'{default: expr}`
+    Default(Expression),
+}
+
+impl AssignmentPatternItem {
+    pub fn expr(&self) -> &Expression {
+        match self {
+            Self::Ordered(e) => e,
+            Self::Named(_, e) => e,
+            Self::Typed(_, e) => e,
+            Self::Default(e) => e,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +79,7 @@ pub enum RangeKind { Constant, IndexedUp, IndexedDown }
 pub enum UnaryOp {
     Plus, Minus, LogNot, BitNot, BitAnd, BitNand, BitOr, BitNor, BitXor, BitXnor,
     PreIncr, PreDecr, PostIncr, PostDecr,
+    HashHash,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +91,9 @@ pub enum BinaryOp {
     BitAnd, BitOr, BitXor, BitXnor,
     ShiftLeft, ShiftRight, ArithShiftLeft, ArithShiftRight,
     Assign,
+    OrMinusArrow, OrFatArrow,
+    HashHash,
+    Iff,
 }
 
 #[derive(Clone)]

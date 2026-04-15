@@ -3,7 +3,7 @@
 use super::Parser;
 use crate::ast::stmt::*;
 use crate::ast::expr::{ExprKind, BinaryOp, Expression};
-use crate::ast::types::{DataType, TypeName};
+use crate::ast::types::{DataType, TypeName, Lifetime};
 use crate::lexer::token::TokenKind;
 
 impl Parser {
@@ -11,6 +11,7 @@ impl Parser {
         let start = self.current().span.start;
 
         match self.current_kind() {
+            TokenKind::Directive => { self.bump(); self.parse_statement() }
             TokenKind::KwBegin => self.parse_seq_block(),
             TokenKind::KwFork => self.parse_par_block(),
             TokenKind::KwIf | TokenKind::KwUnique | TokenKind::KwUnique0 | TokenKind::KwPriority => {
@@ -50,11 +51,49 @@ impl Parser {
                     Statement::new(StatementKind::Wait { condition: cond, stmt: Box::new(stmt) }, self.span_from(start))
                 }
             }
+            TokenKind::KwStatic | TokenKind::KwAutomatic | TokenKind::KwLocal => {
+                let mut lifetime = None;
+                if self.at(TokenKind::KwStatic) { lifetime = Some(Lifetime::Static); self.bump(); }
+                else if self.at(TokenKind::KwAutomatic) { lifetime = Some(Lifetime::Automatic); self.bump(); }
+                else if self.at(TokenKind::KwLocal) { self.bump(); } // skip local
+                
+                if lifetime.is_none() {
+                    if self.at(TokenKind::KwStatic) { lifetime = Some(Lifetime::Static); self.bump(); }
+                    else if self.at(TokenKind::KwAutomatic) { lifetime = Some(Lifetime::Automatic); self.bump(); }
+                }
+                let data_type = if self.is_data_type_keyword() || self.at(TokenKind::Identifier) {
+                    self.parse_data_type()
+                } else {
+                    DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) }
+                };
+                let mut declarators = Vec::new();
+                loop {
+                    let ds = self.current().span.start;
+                    let name = self.parse_identifier();
+                    let dimensions = self.parse_unpacked_dimensions();
+                    let init = if self.eat(TokenKind::Assign).is_some() {
+                        Some(self.parse_expression())
+                    } else { None };
+                    declarators.push(VarDeclarator { name, dimensions, init, span: self.span_from(ds) });
+                    if self.eat(TokenKind::Comma).is_none() { break; }
+                }
+                self.expect(TokenKind::Semicolon);
+                Statement::new(StatementKind::VarDecl { data_type, lifetime, declarators }, self.span_from(start))
+            }
+            TokenKind::KwTypedef => {
+                let _ = self.parse_typedef_declaration();
+                Statement::new(StatementKind::Null, self.span_from(start))
+            }
             TokenKind::KwDisable => {
                 self.bump();
-                let name = self.parse_identifier();
-                self.expect(TokenKind::Semicolon);
-                Statement::new(StatementKind::Disable(name), self.span_from(start))
+                if self.eat(TokenKind::KwFork).is_some() {
+                    self.expect(TokenKind::Semicolon);
+                    Statement::new(StatementKind::Null, self.span_from(start))
+                } else {
+                    let name = self.parse_identifier();
+                    self.expect(TokenKind::Semicolon);
+                    Statement::new(StatementKind::Disable(name), self.span_from(start))
+                }
             }
             TokenKind::KwAssert | TokenKind::KwAssume | TokenKind::KwCover => {
                 Statement::new(StatementKind::Assertion(self.parse_assertion_statement()), self.span_from(start))
@@ -87,6 +126,22 @@ impl Parser {
                     ProceduralContinuous::Deassign(lv)
                 ), self.span_from(start))
             }
+            TokenKind::KwCoverpoint => {
+                self.bump();
+                let expr = self.parse_expression();
+                self.expect(TokenKind::Semicolon);
+                Statement::new(StatementKind::Coverpoint { name: None, expr, span: self.span_from(start) }, self.span_from(start))
+            }
+            TokenKind::KwCross => {
+                self.bump();
+                let mut items = Vec::new();
+                loop {
+                    items.push(self.parse_expression());
+                    if self.eat(TokenKind::Comma).is_none() { break; }
+                }
+                self.expect(TokenKind::Semicolon);
+                Statement::new(StatementKind::Cross { name: None, items, span: self.span_from(start) }, self.span_from(start))
+            }
             TokenKind::KwRelease => {
                 self.bump();
                 let lv = self.parse_expression();
@@ -104,6 +159,25 @@ impl Parser {
                     stmt: Box::new(stmt),
                 }, self.span_from(start))
             }
+            // Event trigger: ->, ->>
+            TokenKind::Arrow | TokenKind::DoubleArrow => {
+                let nonblocking = self.bump().kind == TokenKind::DoubleArrow;
+                let target = self.parse_expression();
+                self.expect(TokenKind::Semicolon);
+                let name = match target.kind {
+                    ExprKind::Ident(hier) => {
+                        hier.path.last().map(|seg| seg.name.clone()).unwrap_or_else(|| crate::ast::Identifier {
+                            name: "event".to_string(),
+                            span: self.span_from(start),
+                        })
+                    }
+                    _ => crate::ast::Identifier {
+                        name: "event".to_string(),
+                        span: self.span_from(start),
+                    },
+                };
+                Statement::new(StatementKind::EventTrigger { nonblocking, name, span: self.span_from(start) }, self.span_from(start))
+            }
             // Delay control: #
             TokenKind::Hash => {
                 self.bump();
@@ -115,7 +189,11 @@ impl Parser {
                 }, self.span_from(start))
             }
             // Variable declaration (data type keywords)
-            k if self.is_data_type_keyword() && k != TokenKind::KwEvent => {
+            k if self.is_data_type_keyword() && k != TokenKind::KwEvent &&
+                 !(self.peek_kind() == TokenKind::IntegerLiteral && {
+                     let next_text = self.tokens.get(self.pos + 1).map(|t| t.text.as_str()).unwrap_or("");
+                     next_text == "'"
+                 }) => {
                 let data_type = self.parse_data_type();
                 let lifetime = None;
                 let mut declarators = Vec::new();
@@ -132,25 +210,36 @@ impl Parser {
                 self.expect(TokenKind::Semicolon);
                 Statement::new(StatementKind::VarDecl { data_type, lifetime, declarators }, self.span_from(start))
             }
+            TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef => {
+                let start = self.current().span.start;
+                self.bump();
+                while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) { self.bump(); }
+                self.expect(TokenKind::Semicolon);
+                Statement::new(StatementKind::Null, self.span_from(start))
+            }
             // Null statement
             TokenKind::Semicolon => {
                 self.bump();
                 Statement::new(StatementKind::Null, self.span_from(start))
             }
+            // Event declaration
+            TokenKind::KwEvent => {
+                self.bump();
+                let mut names = Vec::new();
+                loop {
+                    names.push(self.parse_identifier());
+                    if self.eat(TokenKind::Comma).is_none() { break; }
+                }
+                self.expect(TokenKind::Semicolon);
+                Statement::new(StatementKind::Null, self.span_from(start)) // Skip for now
+            }
             // User-defined type variable declaration: TypeName var [= expr];
-            // Detected by: Identifier followed by Identifier (not '.' or '(' or '[' etc.)
-            TokenKind::Identifier if self.peek_kind() == TokenKind::Identifier
-                || (self.peek_kind() == TokenKind::LBracket && {
-                    // Could be array type or index — heuristic: if tokens after ] are an identifier, it's a type
-                    false // conservative: only handle simple Ident Ident pattern
-                }) =>
+            // Detected by: Identifier followed by Identifier, Hash (if followed by identifier), 
+            // or DoubleColon (if followed by identifier).
+            // Expressions starting with Identifier: class_scope::member, pkg::member, obj.member
+            TokenKind::Identifier if !self.peek_is_class_scope() && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::Hash | TokenKind::DoubleColon) =>
             {
-                let type_name = self.parse_identifier();
-                let data_type = DataType::TypeReference {
-                    name: TypeName { scope: None, name: type_name, span: self.span_from(start) },
-                    dimensions: Vec::new(),
-                    span: self.span_from(start),
-                };
+                let data_type = self.parse_data_type();
                 let mut declarators = Vec::new();
                 loop {
                     let ds = self.current().span.start;
@@ -177,9 +266,24 @@ impl Parser {
                     TokenKind::OrAssign, TokenKind::XorAssign,
                     TokenKind::ShiftLeftAssign, TokenKind::ShiftRightAssign,
                 ]) {
+                    let op_kind = self.current().kind.clone();
                     self.bump();
-                    let rvalue = self.parse_expression();
+                    let rhs = self.parse_expression();
                     self.expect(TokenKind::Semicolon);
+                    // Expand compound assignments: lhs += rhs => lhs = lhs + rhs
+                    let rvalue = match op_kind {
+                        TokenKind::PlusAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Add, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
+                        TokenKind::MinusAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Sub, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
+                        TokenKind::StarAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Mul, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
+                        TokenKind::SlashAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Div, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
+                        TokenKind::PercentAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Mod, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
+                        TokenKind::AndAssign => Expression::new(ExprKind::Binary { op: BinaryOp::BitAnd, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
+                        TokenKind::OrAssign => Expression::new(ExprKind::Binary { op: BinaryOp::BitOr, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
+                        TokenKind::XorAssign => Expression::new(ExprKind::Binary { op: BinaryOp::BitXor, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
+                        TokenKind::ShiftLeftAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ShiftLeft, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
+                        TokenKind::ShiftRightAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ShiftRight, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
+                        _ => rhs, // TokenKind::Assign - plain assignment
+                    };
                     Statement::new(StatementKind::BlockingAssign { lvalue: expr, rvalue }, self.span_from(start))
                 } else if self.at(TokenKind::Leq) {
                     // Nonblocking assignment: lvalue <= rvalue
@@ -317,7 +421,7 @@ impl Parser {
         // Init
         let mut init = Vec::new();
         if !self.at(TokenKind::Semicolon) {
-            if self.is_data_type_keyword() {
+            if self.is_data_type_keyword() || (self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::Identifier) {
                 let dt = self.parse_data_type();
                 let name = self.parse_identifier();
                 self.expect(TokenKind::Assign);
@@ -364,18 +468,16 @@ impl Parser {
         let start = self.current().span.start;
         self.expect(TokenKind::KwForeach);
         self.expect(TokenKind::LParen);
-        let array = self.parse_identifier();
-        let array_expr = crate::ast::expr::Expression::new(
-            crate::ast::expr::ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                root: None,
-                path: vec![crate::ast::expr::HierPathSegment { name: array, selects: Vec::new() }],
-                span: self.span_from(start),
-                cached_signal_id: std::cell::Cell::new(None),
-            }),
-            self.span_from(start),
-        );
-        self.expect(TokenKind::LBracket);
+        
+        // Array name: can be hierarchical, but NO indices yet.
+        let array_hier = self.parse_hierarchical_identifier();
+        let array_expr = Expression::new(ExprKind::Ident(array_hier), self.span_from(start));
+        // Actually, parse_expression_prefix might be too limited.
+        // Let's just parse a HierarchicalIdentifier manually or via a new helper.
+        // For UVM, most are simple or pkg::name.
+        
         let mut vars = Vec::new();
+        self.expect(TokenKind::LBracket);
         loop {
             if self.at(TokenKind::RBracket) { break; }
             if self.at(TokenKind::Comma) {
@@ -386,6 +488,7 @@ impl Parser {
             if self.eat(TokenKind::Comma).is_none() { break; }
         }
         self.expect(TokenKind::RBracket);
+        
         self.expect(TokenKind::RParen);
         let body = self.parse_statement();
         Statement::new(StatementKind::Foreach {
@@ -457,8 +560,8 @@ impl Parser {
             self.expect(TokenKind::RParen);
             EventControl::EventExpr(events)
         } else {
-            let id = self.parse_identifier();
-            EventControl::Identifier(id)
+            let expr = self.parse_hierarchical_identifier_expr();
+            EventControl::HierIdentifier(expr)
         }
     }
 
@@ -469,6 +572,7 @@ impl Parser {
             TokenKind::KwCover => AssertionKind::Cover,
             _ => AssertionKind::Assert,
         };
+        self.eat(TokenKind::KwProperty); // Optional "property" keyword
         self.expect(TokenKind::LParen);
         let expr = self.parse_expression();
         self.expect(TokenKind::RParen);

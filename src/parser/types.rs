@@ -13,10 +13,12 @@ impl Parser {
             TokenKind::KwReal | TokenKind::KwShortreal | TokenKind::KwRealtime |
             TokenKind::KwString | TokenKind::KwChandle | TokenKind::KwEvent |
             TokenKind::KwVoid | TokenKind::KwStruct | TokenKind::KwUnion |
-            TokenKind::KwEnum | TokenKind::KwSigned | TokenKind::KwUnsigned
+            TokenKind::KwEnum | TokenKind::KwSigned | TokenKind::KwUnsigned |
+            TokenKind::KwInterface
         )
     }
 
+    #[allow(dead_code)]
     pub(super) fn is_type_start(&self) -> bool {
         self.is_data_type_keyword() || self.at(TokenKind::Identifier)
     }
@@ -53,6 +55,14 @@ impl Parser {
             TokenKind::KwString => { self.bump(); DataType::Simple { kind: SimpleType::String, span: self.span_from(start) } }
             TokenKind::KwChandle => { self.bump(); DataType::Simple { kind: SimpleType::Chandle, span: self.span_from(start) } }
             TokenKind::KwEvent => { self.bump(); DataType::Simple { kind: SimpleType::Event, span: self.span_from(start) } }
+            TokenKind::KwInterface => {
+                self.bump();
+                let name = self.parse_identifier();
+                let modport = if self.eat(TokenKind::Dot).is_some() {
+                    Some(self.parse_identifier())
+                } else { None };
+                DataType::Interface { name, modport, span: self.span_from(start) }
+            }
             TokenKind::KwVoid => { self.bump(); DataType::Void(self.span_from(start)) }
             TokenKind::KwEnum => self.parse_enum_type(),
             TokenKind::KwStruct | TokenKind::KwUnion => self.parse_struct_type(),
@@ -63,8 +73,25 @@ impl Parser {
             }
             TokenKind::Identifier => {
                 let name = self.parse_type_name();
-                let dimensions = self.parse_packed_dimensions();
-                DataType::TypeReference { name, dimensions, span: self.span_from(start) }
+                // Skip optional parameterized type list #(...)
+                if self.eat(TokenKind::Hash).is_some() {
+                    if self.eat(TokenKind::LParen).is_some() {
+                        let mut depth = 1;
+                        while depth > 0 && !self.at(TokenKind::Eof) {
+                            if self.at(TokenKind::LParen) { depth += 1; }
+                            else if self.at(TokenKind::RParen) { depth -= 1; }
+                            self.bump();
+                        }
+                    }
+                }
+                if name.scope.is_none() && self.at(TokenKind::Dot) {
+                    self.bump();
+                    let modport = Some(self.parse_identifier());
+                    let dimensions = self.parse_packed_dimensions();
+                    DataType::Interface { name: name.name, modport, span: self.span_from(start) }
+                } else {
+                    DataType::TypeReference { name, dimensions: Vec::new(), span: self.span_from(start) }
+                }
             }
             _ => DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) }
         }
@@ -130,8 +157,22 @@ impl Parser {
                 dims.push(UnpackedDimension::Unsized(self.span_from(start)));
             } else if self.at(TokenKind::Dollar) {
                 self.bump();
+                let max_size = if self.eat(TokenKind::Colon).is_some() {
+                    Some(Box::new(self.parse_expression()))
+                } else { None };
                 self.expect(TokenKind::RBracket);
-                dims.push(UnpackedDimension::Queue { max_size: None, span: self.span_from(start) });
+                dims.push(UnpackedDimension::Queue { max_size, span: self.span_from(start) });
+            } else if self.at(TokenKind::Star) {
+                self.bump();
+                self.expect(TokenKind::RBracket);
+                dims.push(UnpackedDimension::Associative { data_type: None, span: self.span_from(start) });
+            } else if self.is_type_start() {
+                // Peek ahead: if it's "type ]" it's definitely associative
+                // If it's "expr : expr ]" or "expr ]" it might be an expression
+                // But most type keywords are NOT valid starts of expressions unless they are casts (which have ')
+                let dt = self.parse_data_type();
+                self.expect(TokenKind::RBracket);
+                dims.push(UnpackedDimension::Associative { data_type: Some(Box::new(dt)), span: self.span_from(start) });
             } else {
                 let expr = self.parse_expression();
                 if self.eat(TokenKind::Colon).is_some() {
@@ -151,14 +192,24 @@ impl Parser {
         }
         dims
     }
-
-    fn parse_enum_type(&mut self) -> DataType {
-        let start = self.current().span.start;
-        self.expect(TokenKind::KwEnum);
-        let base_type = if self.is_data_type_keyword() {
+fn parse_enum_type(&mut self) -> DataType {
+    let start = self.current().span.start;
+    self.expect(TokenKind::KwEnum);
+    let base_type = if self.is_data_type_keyword() || self.at(TokenKind::Identifier) {
+        if self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::LBrace {
+            // This is the enum name, not a base type
+            None
+        } else {
             Some(Box::new(self.parse_data_type()))
-        } else { None };
-        self.expect(TokenKind::LBrace);
+        }
+    } else { None };
+
+    let _name = if self.at(TokenKind::Identifier) {
+        Some(self.parse_identifier())
+    } else { None };
+
+    self.expect(TokenKind::LBrace);
+
         let mut members = Vec::new();
         loop {
             if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) { break; }

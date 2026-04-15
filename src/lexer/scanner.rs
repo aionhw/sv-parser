@@ -30,8 +30,14 @@ impl<'a> Lexer<'a> {
                 if self.input[self.pos + 1] == b'*' {
                     self.pos += 2;
                     while self.pos + 1 < self.input.len() {
-                        if self.input[self.pos] == b'*' && self.input[self.pos + 1] == b'/' { self.pos += 2; break; }
+                        if self.input[self.pos] == b'*' && self.input[self.pos + 1] == b'/' {
+                            self.pos += 2;
+                            break;
+                        }
                         self.pos += 1;
+                    }
+                    if self.pos >= self.input.len() {
+                        // Unclosed block comment - just stop
                     }
                     continue;
                 }
@@ -46,8 +52,24 @@ impl<'a> Lexer<'a> {
     }
 
     fn skip_whitespace(&mut self) {
-        while self.pos < self.input.len() && self.input[self.pos].is_ascii_whitespace() {
-            self.pos += 1;
+        while self.pos < self.input.len() {
+            let ch = self.input[self.pos];
+            if ch.is_ascii_whitespace() {
+                self.pos += 1;
+                continue;
+            }
+            // Handle line continuation: \ followed by optional spaces and then newline
+            if ch == b'\\' && self.pos + 1 < self.input.len() {
+                let mut p = self.pos + 1;
+                while p < self.input.len() && (self.input[p] == b' ' || self.input[p] == b'\t' || self.input[p] == b'\r') {
+                    p += 1;
+                }
+                if p < self.input.len() && self.input[p] == b'\n' {
+                    self.pos = p + 1;
+                    continue;
+                }
+            }
+            break;
         }
     }
 
@@ -241,7 +263,26 @@ impl<'a> Lexer<'a> {
                 self.pos += 1;
                 match self.input.get(self.pos) {
                     Some(b'|') => { self.pos += 1; Token::new(TokenKind::LogOr, "||".into(), Span::new(start, self.pos)) }
-                    Some(b'=') => { self.pos += 1; Token::new(TokenKind::OrAssign, "|=".into(), Span::new(start, self.pos)) }
+                    Some(b'=') => {
+                        self.pos += 1;
+                        if self.input.get(self.pos) == Some(&b'>') {
+                            self.pos += 1;
+                            Token::new(TokenKind::OrFatArrow, "|=>".into(), Span::new(start, self.pos))
+                        } else {
+                            Token::new(TokenKind::OrAssign, "|=".into(), Span::new(start, self.pos))
+                        }
+                    }
+                    Some(b'-') => {
+                        self.pos += 1;
+                        if self.input.get(self.pos) == Some(&b'>') {
+                            self.pos += 1;
+                            Token::new(TokenKind::OrMinusArrow, "|->".into(), Span::new(start, self.pos))
+                        } else {
+                            // Backtrack or just bitwise or and minus. Since `-` isn't assignment, return `|` and leave `-`
+                            self.pos -= 1;
+                            Token::new(TokenKind::BitOr, "|".into(), Span::new(start, self.pos))
+                        }
+                    }
                     _ => Token::new(TokenKind::BitOr, "|".into(), Span::new(start, self.pos))
                 }
             }

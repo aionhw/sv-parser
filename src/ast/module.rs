@@ -62,6 +62,30 @@ pub enum PortList {
     NonAnsi(Vec<Identifier>),
 }
 
+impl PortList {
+    pub fn get(&self, i: usize) -> Option<GenericPort> {
+        match self {
+            PortList::Ansi(ports) => ports.get(i).map(|p| GenericPort::Ansi(p)),
+            PortList::NonAnsi(names) => names.get(i).map(|n| GenericPort::NonAnsi(n)),
+            PortList::Empty => None,
+        }
+    }
+}
+
+pub enum GenericPort<'a> {
+    Ansi(&'a AnsiPort),
+    NonAnsi(&'a Identifier),
+}
+
+impl<'a> GenericPort<'a> {
+    pub fn name(&self) -> &str {
+        match self {
+            GenericPort::Ansi(p) => &p.name.name,
+            GenericPort::NonAnsi(n) => &n.name,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AnsiPort {
     pub attrs: Vec<AttributeInstance>,

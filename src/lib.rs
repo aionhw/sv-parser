@@ -25,11 +25,15 @@ pub mod lexer;
 pub mod parser;
 pub mod preprocessor;
 
+#[cfg(test)]
+mod tests;
+
 use std::path::{Path, PathBuf};
-use std::collections::HashMap;
 
 /// Result of parsing a SystemVerilog source.
 pub struct ParseResult {
+    /// The original (preprocessed) source text.
+    pub source_text: String,
     /// The parsed AST.
     pub source: ast::SourceText,
     /// Parse errors (empty if successful).
@@ -81,6 +85,7 @@ pub fn parse_with_options(
     let (errors, warnings) = partition_diagnostics(parser.diagnostics());
 
     ParseResult {
+        source_text: processed,
         source: source_text,
         errors,
         warnings,
@@ -118,15 +123,18 @@ pub fn parse_multi(sources: &[&str]) -> ParseResult {
     let mut all_descriptions = Vec::new();
     let mut all_errors = Vec::new();
     let mut all_warnings = Vec::new();
+    let mut all_source = String::new();
 
     for source in sources {
         let result = parse(source);
         all_descriptions.extend(result.source.descriptions);
         all_errors.extend(result.errors);
         all_warnings.extend(result.warnings);
+        all_source.push_str(&result.source_text);
     }
 
     ParseResult {
+        source_text: all_source,
         source: ast::SourceText {
             descriptions: all_descriptions,
             span: ast::Span::dummy(),

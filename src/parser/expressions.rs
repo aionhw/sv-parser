@@ -99,6 +99,33 @@ impl Parser {
         let mut lhs = self.parse_prefix();
 
         loop {
+            // inside operator: expr inside { range_list }
+            // Binding power 15 (same as relational)
+            if self.at(TokenKind::KwInside) {
+                if 15 < min_bp { break; }
+                self.bump();
+                self.expect(TokenKind::LBrace);
+                let mut ranges = Vec::new();
+                loop {
+                    if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) { break; }
+                    // Handle [lo:hi] ranges
+                    if self.at(TokenKind::LBracket) {
+                        self.bump();
+                        let lo = self.parse_expression();
+                        self.expect(TokenKind::Colon);
+                        let hi = self.parse_expression();
+                        self.expect(TokenKind::RBracket);
+                        ranges.push(Expression::new(ExprKind::Range(Box::new(lo), Box::new(hi)), self.span_from(start)));
+                    } else {
+                        ranges.push(self.parse_expression());
+                    }
+                    if self.eat(TokenKind::Comma).is_none() { break; }
+                }
+                self.expect(TokenKind::RBrace);
+                lhs = Expression::new(ExprKind::Inside { expr: Box::new(lhs), ranges }, self.span_from(start));
+                continue;
+            }
+
             // Check for postfix: ++ --
             if self.at(TokenKind::Increment) || self.at(TokenKind::Decrement) {
                 let op = if self.at(TokenKind::Increment) { UnaryOp::PostIncr } else { UnaryOp::PostDecr };
@@ -158,6 +185,16 @@ impl Parser {
                         expr: Box::new(lhs), member,
                     }, self.span_from(start));
                     let args = self.parse_call_args();
+                    if self.eat(TokenKind::KwWith).is_some() {
+                        if self.eat(TokenKind::LBrace).is_some() {
+                            let mut depth = 1;
+                            while depth > 0 && !self.at(TokenKind::Eof) {
+                                if self.at(TokenKind::LBrace) { depth += 1; }
+                                else if self.at(TokenKind::RBrace) { depth -= 1; }
+                                self.bump();
+                            }
+                        }
+                    }
                     lhs = Expression::new(ExprKind::Call {
                         func: Box::new(member_expr), args,
                     }, self.span_from(start));
@@ -179,11 +216,42 @@ impl Parser {
                 continue;
             }
 
-            // Index/range select: [expr] or [expr:expr] or [expr+:expr]
+            // Function call: (args)
+            if self.at(TokenKind::LParen) {
+                let args = self.parse_call_args();
+                if self.eat(TokenKind::KwWith).is_some() {
+                    if self.eat(TokenKind::LBrace).is_some() {
+                        let mut depth = 1;
+                        while depth > 0 && !self.at(TokenKind::Eof) {
+                            if self.at(TokenKind::LBrace) { depth += 1; }
+                            else if self.at(TokenKind::RBrace) { depth -= 1; }
+                            self.bump();
+                        }
+                    }
+                }
+                lhs = Expression::new(ExprKind::Call {
+                    func: Box::new(lhs), args,
+                }, self.span_from(start));
+                continue;
+            }
+
+            // Index/range select: [expr] or [expr:expr] or [expr+:expr] or new[size]
             if self.at(TokenKind::LBracket) {
                 self.bump();
                 let idx = self.parse_expression();
-                if self.eat(TokenKind::Colon).is_some() {
+                
+                // Special case: new[size] for dynamic arrays
+                let is_new = if let ExprKind::Ident(ref hier) = lhs.kind {
+                    hier.path.len() == 1 && hier.path[0].name.name == "new"
+                } else { false };
+
+                if is_new {
+                    self.expect(TokenKind::RBracket);
+                    lhs = Expression::new(ExprKind::Call {
+                        func: Box::new(lhs),
+                        args: vec![idx],
+                    }, self.span_from(start));
+                } else if self.eat(TokenKind::Colon).is_some() {
                     let right = self.parse_expression();
                     self.expect(TokenKind::RBracket);
                     lhs = Expression::new(ExprKind::RangeSelect {
@@ -220,6 +288,16 @@ impl Parser {
                 continue;
             }
 
+            // with clause: expr with ( filter_expr )
+            if self.eat(TokenKind::KwWith).is_some() {
+                self.expect(TokenKind::LParen);
+                let _filter = self.parse_expression();
+                self.expect(TokenKind::RParen);
+                // For now, keep lhs as is (treat with as side-effect/info)
+                // In full AST we would wrap it.
+                continue;
+            }
+
             break;
         }
 
@@ -227,7 +305,7 @@ impl Parser {
     }
 
     /// Parse prefix / primary expression.
-    fn parse_prefix(&mut self) -> Expression {
+    pub(super) fn parse_prefix(&mut self) -> Expression {
         let start = self.current().span.start;
 
         match self.current_kind() {
@@ -259,14 +337,39 @@ impl Parser {
             // Assignment pattern: '{ ... }
             TokenKind::ApostropheLBrace => {
                 self.bump();
-                let mut exprs = Vec::new();
+                let mut items = Vec::new();
                 loop {
                     if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) { break; }
-                    exprs.push(self.parse_expression());
+                    
+                    // Possible items:
+                    // 1. default: expr
+                    // 2. type: expr
+                    // 3. name: expr
+                    // 4. expr (ordered)
+                    
+                    if self.at(TokenKind::KwDefault) {
+                        self.bump();
+                        self.expect(TokenKind::Colon);
+                        let expr = self.parse_expression();
+                        items.push(AssignmentPatternItem::Default(expr));
+                    } else if self.is_data_type_keyword() && self.peek_kind() == TokenKind::Colon {
+                        let dt = self.parse_data_type();
+                        self.expect(TokenKind::Colon);
+                        let expr = self.parse_expression();
+                        items.push(AssignmentPatternItem::Typed(dt, expr));
+                    } else if (self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier)) && self.peek_kind() == TokenKind::Colon {
+                        let name = self.parse_identifier();
+                        self.expect(TokenKind::Colon);
+                        let expr = self.parse_expression();
+                        items.push(AssignmentPatternItem::Named(name, expr));
+                    } else {
+                        items.push(AssignmentPatternItem::Ordered(self.parse_expression()));
+                    }
+                    
                     if self.eat(TokenKind::Comma).is_none() { break; }
                 }
                 self.expect(TokenKind::RBrace);
-                Expression::new(ExprKind::AssignmentPattern(exprs), self.span_from(start))
+                Expression::new(ExprKind::AssignmentPattern(items), self.span_from(start))
             }
 
             // Number literals
@@ -329,9 +432,20 @@ impl Parser {
                 Expression::new(ExprKind::Ident(hier), self.span_from(start))
             }
 
-            // Identifier (possibly followed by function call)
+            // Identifier (possibly followed by function call or class scope)
             TokenKind::Identifier | TokenKind::EscapedIdentifier => {
                 let id = self.parse_identifier();
+                // Skip optional parameterized type list #(...) for class scope
+                if self.eat(TokenKind::Hash).is_some() {
+                    if self.eat(TokenKind::LParen).is_some() {
+                        let mut depth = 1;
+                        while depth > 0 && !self.at(TokenKind::Eof) {
+                            if self.at(TokenKind::LParen) { depth += 1; }
+                            else if self.at(TokenKind::RParen) { depth -= 1; }
+                            self.bump();
+                        }
+                    }
+                }
                 let hier = HierarchicalIdentifier {
                     root: None,
                     path: vec![HierPathSegment { name: id, selects: Vec::new() }],
@@ -350,6 +464,16 @@ impl Parser {
                 // Check for function call
                 if self.at(TokenKind::LParen) {
                     let args = self.parse_call_args();
+                    if self.eat(TokenKind::KwWith).is_some() {
+                        if self.eat(TokenKind::LBrace).is_some() {
+                            let mut depth = 1;
+                            while depth > 0 && !self.at(TokenKind::Eof) {
+                                if self.at(TokenKind::LBrace) { depth += 1; }
+                                else if self.at(TokenKind::RBrace) { depth -= 1; }
+                                self.bump();
+                            }
+                        }
+                    }
                     Expression::new(ExprKind::Call {
                         func: Box::new(expr), args,
                     }, self.span_from(start))
@@ -358,12 +482,14 @@ impl Parser {
                 }
             }
 
-            // Type cast: type'(expr) — e.g., logic'(x), int'(x), bit'(x)
+            // Type cast: type'(expr) — e.g., logic'(x), int'(x), bit'(x), void'(x)
             // These are SystemVerilog casting expressions (IEEE 1800-2017 §6.24.1)
             // For simulation, treat as pass-through (the cast is a type/size hint).
             TokenKind::KwLogic | TokenKind::KwBit | TokenKind::KwByte |
             TokenKind::KwInt | TokenKind::KwShortint | TokenKind::KwLongint |
-            TokenKind::KwInteger | TokenKind::KwReg | TokenKind::KwSigned | TokenKind::KwUnsigned
+            TokenKind::KwInteger | TokenKind::KwReg | TokenKind::KwSigned | TokenKind::KwUnsigned |
+            TokenKind::KwVoid | TokenKind::KwString |
+            TokenKind::KwReal | TokenKind::KwShortreal | TokenKind::KwRealtime
                 if {
                     // Look ahead: is this type_keyword'(expr) ?
                     let next = self.peek_kind();
@@ -381,7 +507,7 @@ impl Parser {
                 Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start))
             }
 
-            // new expression: new(args) or new[size]
+            // new expression: new(args) or new[size] or just new
             TokenKind::KwNew => {
                 let tok = self.bump();
                 let name_id = Identifier { name: tok.text.clone(), span: Span { start: tok.span.start, end: tok.span.end } };
@@ -391,19 +517,20 @@ impl Parser {
                     span: self.span_from(start),
                     cached_signal_id: std::cell::Cell::new(None),
                 };
-                let func_expr = Expression::new(ExprKind::Ident(hier), self.span_from(start));
-                if self.at(TokenKind::LParen) {
-                    let args = self.parse_call_args();
-                    Expression::new(ExprKind::Call { func: Box::new(func_expr), args }, self.span_from(start))
-                } else if self.at(TokenKind::LBracket) {
-                    // new[size] for dynamic arrays
-                    self.bump();
-                    let size = self.parse_expression();
-                    self.expect(TokenKind::RBracket);
-                    Expression::new(ExprKind::Call { func: Box::new(func_expr), args: vec![size] }, self.span_from(start))
-                } else {
-                    func_expr
-                }
+                Expression::new(ExprKind::Ident(hier), self.span_from(start))
+            }
+
+            // Data type keywords used as expressions (e.g. $bits(int))
+            k if self.is_data_type_keyword() || k == TokenKind::KwVoid => {
+                let dt = self.parse_data_type();
+                // Treat as empty expression for now, but we've consumed the type
+                Expression::new(ExprKind::Empty, self.span_from(start))
+            }
+
+            TokenKind::HashHash => {
+                let start = self.current().span.start; self.bump();
+                let operand = self.parse_expr_bp(30);
+                Expression::new(ExprKind::Unary { op: UnaryOp::HashHash, operand: Box::new(operand) }, self.span_from(start))
             }
 
             _ => {
@@ -417,6 +544,25 @@ impl Parser {
     fn parse_concatenation(&mut self) -> Expression {
         let start = self.current().span.start;
         self.expect(TokenKind::LBrace);
+        
+        // Handle streaming operators { >> [slice_size] { ... } } or { << [slice_size] { ... } }
+        if self.at(TokenKind::ShiftRight) || self.at(TokenKind::ShiftLeft) {
+            self.bump();
+            // Optional slice size
+            if !self.at(TokenKind::LBrace) {
+                let _ = self.parse_expression();
+            }
+            self.expect(TokenKind::LBrace);
+            let mut depth = 1;
+            while depth > 0 && !self.at(TokenKind::Eof) {
+                if self.at(TokenKind::LBrace) { depth += 1; }
+                else if self.at(TokenKind::RBrace) { depth -= 1; }
+                self.bump();
+            }
+            self.expect(TokenKind::RBrace);
+            return Expression::new(ExprKind::Empty, self.span_from(start));
+        }
+
         if self.at(TokenKind::RBrace) {
             self.bump();
             return Expression::new(ExprKind::Concatenation(Vec::new()), self.span_from(start));
@@ -452,43 +598,162 @@ impl Parser {
         if self.at(TokenKind::RParen) { self.bump(); return args; }
         loop {
             if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) { break; }
-            args.push(self.parse_expression());
-            if self.eat(TokenKind::Comma).is_none() { break; }
+            
+            let start = self.current().span.start;
+            if self.at(TokenKind::Comma) {
+                // Empty argument: foo(a, , b)
+                args.push(Expression::new(ExprKind::Empty, self.span_from(start)));
+            } else if self.eat(TokenKind::Dot).is_some() {
+                let name = self.parse_identifier();
+                let expr = if self.eat(TokenKind::LParen).is_some() {
+                    let e = if !self.at(TokenKind::RParen) { Some(Box::new(self.parse_expression())) } else { None };
+                    self.expect(TokenKind::RParen);
+                    e
+                } else { None };
+                args.push(Expression::new(ExprKind::NamedArg { name, expr }, self.span_from(start)));
+            } else {
+                args.push(self.parse_expression());
+            }
+
+            if self.eat(TokenKind::Comma).is_none() {
+                // Check if we have a trailing comma before the closing paren: foo(a,)
+                // In SV this is valid and means an empty trailing argument.
+                break;
+            } else if self.at(TokenKind::RParen) {
+                // Trailing comma case
+                args.push(Expression::new(ExprKind::Empty, self.span_from(self.current().span.start)));
+                break;
+            }
         }
         self.expect(TokenKind::RParen);
         args
     }
 
-    /// Get infix operator binding power for the current token.
+    /// Parse a hierarchical identifier (handles pkg::name and obj.member).
+    /// Handles internal indices [expr] as well (e.g. successors[s].m_predecessors).
+    pub(super) fn parse_hierarchical_identifier(&mut self) -> HierarchicalIdentifier {
+        let start = self.current().span.start;
+        let id = if self.at(TokenKind::KwThis) || self.at(TokenKind::KwSuper) {
+            let tok = self.bump();
+            Identifier { name: tok.text, span: tok.span }
+        } else {
+            self.parse_identifier()
+        };
+        let mut path = vec![HierPathSegment { name: id, selects: Vec::new() }];
+        
+        loop {
+            if self.at(TokenKind::Dot) {
+                self.bump();
+                let member = self.parse_identifier();
+                path.push(HierPathSegment { name: member, selects: Vec::new() });
+            } else if self.at(TokenKind::DoubleColon) {
+                self.bump();
+                let member = self.parse_identifier();
+                path.push(HierPathSegment { name: member, selects: Vec::new() });
+            } else if self.at(TokenKind::LBracket) {
+                // Peek after the balanced bracket
+                let mut p = self.pos + 1;
+                let mut depth = 1;
+                while depth > 0 && p < self.tokens.len() {
+                    if self.tokens[p].kind == TokenKind::LBracket { depth += 1; }
+                    else if self.tokens[p].kind == TokenKind::RBracket { depth -= 1; }
+                    p += 1;
+                }
+                if let Some(t) = self.tokens.get(p) {
+                    if t.kind == TokenKind::Dot || t.kind == TokenKind::DoubleColon || t.kind == TokenKind::LBracket {
+                        // It's an internal index, consume it
+                        self.bump();
+                        let idx = self.parse_expression();
+                        self.expect(TokenKind::RBracket);
+                        if let Some(last) = path.last_mut() {
+                            last.selects.push(idx);
+                        }
+                        continue;
+                    }
+                }
+                break;
+            } else {
+                break;
+            }
+        }
+        HierarchicalIdentifier {
+            root: None,
+            path,
+            span: self.span_from(start),
+            cached_signal_id: std::cell::Cell::new(None),
+        }
+    }
+    /// Handles indices [expr] as well.
+    pub(super) fn parse_hierarchical_identifier_expr(&mut self) -> Expression {
+        let start = self.current().span.start;
+        let id = self.parse_identifier();
+        let mut hier = HierarchicalIdentifier {
+            root: None,
+            path: vec![HierPathSegment { name: id, selects: Vec::new() }],
+            span: self.span_from(start),
+            cached_signal_id: std::cell::Cell::new(None),
+        };
+        let mut res = Expression::new(ExprKind::Ident(hier), self.span_from(start));
+        
+        loop {
+            if self.at(TokenKind::Dot) {
+                self.bump();
+                let member = self.parse_identifier();
+                res = Expression::new(ExprKind::MemberAccess {
+                    expr: Box::new(res), member,
+                }, self.span_from(start));
+            } else if self.at(TokenKind::DoubleColon) {
+                self.bump();
+                let member = self.parse_identifier();
+                res = Expression::new(ExprKind::MemberAccess {
+                    expr: Box::new(res), member,
+                }, self.span_from(start));
+            } else if self.at(TokenKind::LBracket) {
+                self.bump();
+                let idx = self.parse_expression();
+                self.expect(TokenKind::RBracket);
+                res = Expression::new(ExprKind::Index {
+                    expr: Box::new(res), index: Box::new(idx),
+                }, self.span_from(start));
+            } else {
+                break;
+            }
+        }
+        res
+    }
     fn infix_bp(&self) -> Option<(BinaryOp, u8, u8)> {
         let kind = self.current_kind();
         match kind {
-            TokenKind::LogOr => Some((BinaryOp::LogOr, 2, 3)),
-            TokenKind::LogAnd => Some((BinaryOp::LogAnd, 4, 5)),
-            TokenKind::BitOr => Some((BinaryOp::BitOr, 6, 7)),
-            TokenKind::BitXor => Some((BinaryOp::BitXor, 8, 9)),
-            TokenKind::BitXnor => Some((BinaryOp::BitXnor, 8, 9)),
-            TokenKind::BitAnd => Some((BinaryOp::BitAnd, 10, 11)),
-            TokenKind::Eq => Some((BinaryOp::Eq, 12, 13)),
-            TokenKind::Neq => Some((BinaryOp::Neq, 12, 13)),
-            TokenKind::CaseEq => Some((BinaryOp::CaseEq, 12, 13)),
-            TokenKind::CaseNeq => Some((BinaryOp::CaseNeq, 12, 13)),
-            TokenKind::WildcardEq => Some((BinaryOp::WildcardEq, 12, 13)),
-            TokenKind::WildcardNeq => Some((BinaryOp::WildcardNeq, 12, 13)),
-            TokenKind::Lt => Some((BinaryOp::Lt, 14, 15)),
-            TokenKind::Gt => Some((BinaryOp::Gt, 14, 15)),
-            TokenKind::Leq => Some((BinaryOp::Leq, 14, 15)),
-            TokenKind::Geq => Some((BinaryOp::Geq, 14, 15)),
-            TokenKind::ShiftLeft => Some((BinaryOp::ShiftLeft, 16, 17)),
-            TokenKind::ShiftRight => Some((BinaryOp::ShiftRight, 16, 17)),
-            TokenKind::ArithShiftLeft => Some((BinaryOp::ArithShiftLeft, 16, 17)),
-            TokenKind::ArithShiftRight => Some((BinaryOp::ArithShiftRight, 16, 17)),
-            TokenKind::Plus => Some((BinaryOp::Add, 18, 19)),
-            TokenKind::Minus => Some((BinaryOp::Sub, 18, 19)),
-            TokenKind::Star => Some((BinaryOp::Mul, 20, 21)),
-            TokenKind::Slash => Some((BinaryOp::Div, 20, 21)),
-            TokenKind::Percent => Some((BinaryOp::Mod, 20, 21)),
-            TokenKind::DoubleStar => Some((BinaryOp::Power, 23, 22)), // right-assoc
+            TokenKind::OrMinusArrow => Some((BinaryOp::OrMinusArrow, 1, 2)),
+            TokenKind::OrFatArrow => Some((BinaryOp::OrFatArrow, 1, 2)),
+            TokenKind::HashHash => Some((BinaryOp::HashHash, 28, 27)), // High precedence
+            TokenKind::KwIff => Some((BinaryOp::Iff, 1, 2)),
+            TokenKind::LogOr => Some((BinaryOp::LogOr, 3, 4)),
+            TokenKind::LogAnd => Some((BinaryOp::LogAnd, 5, 6)),
+            TokenKind::BitOr => Some((BinaryOp::BitOr, 7, 8)),
+            TokenKind::BitXor => Some((BinaryOp::BitXor, 9, 10)),
+            TokenKind::BitXnor => Some((BinaryOp::BitXnor, 9, 10)),
+            TokenKind::BitAnd => Some((BinaryOp::BitAnd, 11, 12)),
+            TokenKind::Eq => Some((BinaryOp::Eq, 13, 14)),
+            TokenKind::Neq => Some((BinaryOp::Neq, 13, 14)),
+            TokenKind::CaseEq => Some((BinaryOp::CaseEq, 13, 14)),
+            TokenKind::CaseNeq => Some((BinaryOp::CaseNeq, 13, 14)),
+            TokenKind::WildcardEq => Some((BinaryOp::WildcardEq, 13, 14)),
+            TokenKind::WildcardNeq => Some((BinaryOp::WildcardNeq, 13, 14)),
+            TokenKind::Lt => Some((BinaryOp::Lt, 15, 16)),
+            TokenKind::Gt => Some((BinaryOp::Gt, 15, 16)),
+            TokenKind::Leq => Some((BinaryOp::Leq, 15, 16)),
+            TokenKind::Geq => Some((BinaryOp::Geq, 15, 16)),
+            TokenKind::ShiftLeft => Some((BinaryOp::ShiftLeft, 17, 18)),
+            TokenKind::ShiftRight => Some((BinaryOp::ShiftRight, 17, 18)),
+            TokenKind::ArithShiftLeft => Some((BinaryOp::ArithShiftLeft, 17, 18)),
+            TokenKind::ArithShiftRight => Some((BinaryOp::ArithShiftRight, 17, 18)),
+            TokenKind::Plus => Some((BinaryOp::Add, 19, 20)),
+            TokenKind::Minus => Some((BinaryOp::Sub, 19, 20)),
+            TokenKind::Star => Some((BinaryOp::Mul, 21, 22)),
+            TokenKind::Slash => Some((BinaryOp::Div, 21, 22)),
+            TokenKind::Percent => Some((BinaryOp::Mod, 21, 22)),
+            TokenKind::DoubleStar => Some((BinaryOp::Power, 24, 23)), // right-assoc
             _ => None,
         }
     }

@@ -18,6 +18,7 @@ impl Parser {
         self.tokens.get(self.pos + 1).map(|t| t.kind).unwrap_or(TokenKind::Eof)
     }
 
+    #[allow(dead_code)]
     pub(super) fn peek_kind_n(&self, n: usize) -> TokenKind {
         self.tokens.get(self.pos + n).map(|t| t.kind).unwrap_or(TokenKind::Eof)
     }
@@ -65,6 +66,7 @@ impl Parser {
         self.diagnostics.push(Diagnostic::error(msg, span));
     }
 
+    #[allow(dead_code)]
     pub(super) fn skip_to_semi(&mut self) {
         while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) {
             self.bump();
@@ -88,7 +90,54 @@ impl Parser {
 
     pub(super) fn parse_end_label(&mut self) -> Option<Identifier> {
         if self.eat(TokenKind::Colon).is_some() {
-            Some(self.parse_identifier())
+            if self.at(TokenKind::KwNew) {
+                let tok = self.bump();
+                Some(Identifier { name: tok.text, span: tok.span })
+            } else {
+                Some(self.parse_identifier())
+            }
         } else { None }
+    }
+
+    /// Check if the current identifier is followed by #(...) :: or just ::
+    /// which indicates a class scope (expression) rather than a type declaration.
+    pub(super) fn peek_is_class_scope(&self) -> bool {
+        if !self.at(TokenKind::Identifier) { return false; }
+        let mut p = self.pos + 1;
+        if let Some(t) = self.tokens.get(p) {
+            if t.kind == TokenKind::DoubleColon {
+                p += 1;
+                // Peek after ::
+                if let Some(t2) = self.tokens.get(p) {
+                    if t2.kind == TokenKind::Identifier {
+                        p += 1;
+                        if let Some(t3) = self.tokens.get(p) {
+                            // If followed by another identifier, it's pkg::Type var (declaration)
+                            return t3.kind != TokenKind::Identifier;
+                        }
+                    }
+                }
+                return true;
+            }
+            if t.kind == TokenKind::Hash {
+                p += 1;
+                if let Some(t2) = self.tokens.get(p) {
+                    if t2.kind == TokenKind::LParen {
+                        p += 1;
+                        let mut depth = 1;
+                        while depth > 0 && p < self.tokens.len() {
+                            if self.tokens[p].kind == TokenKind::LParen { depth += 1; }
+                            else if self.tokens[p].kind == TokenKind::RParen { depth -= 1; }
+                            p += 1;
+                        }
+                        if let Some(t3) = self.tokens.get(p) {
+                            // If it has :: after #(...) it's a class scope
+                            return t3.kind == TokenKind::DoubleColon;
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 }
